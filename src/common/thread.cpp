@@ -5,6 +5,8 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
+#include <atomic>
 #include <cstdlib>
 #include <ctime>
 #include <mutex>
@@ -117,22 +119,117 @@ void SetCurrentThreadPriority(ThreadPriority new_priority) {
     SetThreadPriority(handle, windows_priority);
 }
 
+namespace {
+/// One waitable timer per thread, created on first use, closed on exit (upstream shadPS4 #5435).
+/// High resolution, so a guest sleep is not rounded up to the system timer period (1 ms with
+/// timeBeginPeriod(1), 15.6 ms without); SHADPS4_SLEEP_COARSE=1 = the timer as before, a new one
+/// per call. SHADPS4_SLEEP_STATS=1 logs every 10 s how many sleeps ran and how long they took
+/// against what was asked.
+struct ThreadTimer {
+    HANDLE handle{};
+
+    HANDLE Get() {
+        if (!handle) {
+            handle = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
+                                            TIMER_ALL_ACCESS);
+            if (!handle) {
+                handle = CreateWaitableTimerW(nullptr, TRUE, nullptr);
+            }
+        }
+        return handle;
+    }
+
+    void Reset() {
+        if (handle) {
+            CloseHandle(handle);
+            handle = nullptr;
+        }
+    }
+
+    ~ThreadTimer() {
+        Reset();
+    }
+};
+thread_local ThreadTimer thread_timer;
+
+bool EnvIs1(const char* name) {
+    const char* v = std::getenv(name);
+    return v && v[0] == '1';
+}
+const bool g_sleep_coarse = EnvIs1("SHADPS4_SLEEP_COARSE");
+const bool g_sleep_stats = EnvIs1("SHADPS4_SLEEP_STATS");
+std::atomic<u64> g_sleep_calls{0}, g_sleep_asked_ns{0}, g_sleep_took_ns{0}, g_sleep_short{0};
+std::atomic<s64> g_sleep_last_log{0};
+
+void NoteSleep(std::chrono::nanoseconds asked, std::chrono::nanoseconds took) {
+    g_sleep_calls.fetch_add(1, std::memory_order_relaxed);
+    g_sleep_asked_ns.fetch_add(static_cast<u64>(asked.count()), std::memory_order_relaxed);
+    g_sleep_took_ns.fetch_add(static_cast<u64>(took.count()), std::memory_order_relaxed);
+    if (asked < std::chrono::milliseconds(1)) {
+        g_sleep_short.fetch_add(1, std::memory_order_relaxed);
+    }
+    const s64 now = std::chrono::steady_clock::now().time_since_epoch().count();
+    s64 last = g_sleep_last_log.load(std::memory_order_relaxed);
+    if (now - last < 10'000'000'000ll ||
+        !g_sleep_last_log.compare_exchange_strong(last, now, std::memory_order_relaxed)) {
+        return;
+    }
+    const u64 n = g_sleep_calls.exchange(0, std::memory_order_relaxed);
+    const u64 asked_ns = g_sleep_asked_ns.exchange(0, std::memory_order_relaxed);
+    const u64 took_ns = g_sleep_took_ns.exchange(0, std::memory_order_relaxed);
+    const u64 shorts = g_sleep_short.exchange(0, std::memory_order_relaxed);
+    LOG_INFO(Kernel, "SleepStats: {} guest sleeps in 10 s ({} under 1 ms), asked {:.1f} ms, took "
+                     "{:.1f} ms ({} timer)",
+             n, shorts, static_cast<double>(asked_ns) / 1e6, static_cast<double>(took_ns) / 1e6,
+             g_sleep_coarse ? "coarse" : "high-resolution");
+}
+} // namespace
+
 bool AccurateSleep(const std::chrono::nanoseconds duration, std::chrono::nanoseconds* remaining,
                    const bool interruptible) {
+    // Zero or negative sleeps is a yield, no timer.
+    if (duration.count() <= 0) {
+        const auto ret = SleepEx(0, interruptible);
+        if (remaining) {
+            *remaining = std::chrono::nanoseconds(0);
+        }
+        return ret != WAIT_IO_COMPLETION;
+    }
+
     const auto begin_sleep = std::chrono::high_resolution_clock::now();
 
+    // Timer interval is in 100 ns units, sleep shorter than that becomes one unit instead of 0
     LARGE_INTEGER interval{
-        .QuadPart = -1 * (duration.count() / 100u),
+        .QuadPart = -1 * std::max<s64>(duration.count() / 100, 1),
     };
-    HANDLE timer = ::CreateWaitableTimer(NULL, TRUE, NULL);
-    SetWaitableTimer(timer, &interval, 0, NULL, NULL, 0);
-    const auto ret = WaitForSingleObjectEx(timer, INFINITE, interruptible);
-    ::CloseHandle(timer);
+    DWORD ret;
+    if (g_sleep_coarse) {
+        HANDLE timer = ::CreateWaitableTimer(NULL, TRUE, NULL);
+        SetWaitableTimer(timer, &interval, 0, NULL, NULL, 0);
+        ret = WaitForSingleObjectEx(timer, INFINITE, interruptible);
+        ::CloseHandle(timer);
+    } else {
+        HANDLE timer = thread_timer.Get();
+        SetWaitableTimer(timer, &interval, 0, NULL, NULL, 0);
+        ret = WaitForSingleObjectEx(timer, INFINITE, interruptible);
+        // After an interrupted wait the timer is still armed; fired later it would end the next
+        // sleep early. Closed, so the next sleep makes a new one.
+        if (ret != WAIT_OBJECT_0) {
+            thread_timer.Reset();
+        }
+    }
 
-    if (remaining) {
+    if (remaining || g_sleep_stats) {
         const auto end_sleep = std::chrono::high_resolution_clock::now();
         const auto sleep_time = end_sleep - begin_sleep;
-        *remaining = duration > sleep_time ? duration - sleep_time : std::chrono::nanoseconds(0);
+        if (remaining) {
+            *remaining =
+                duration > sleep_time ? duration - sleep_time : std::chrono::nanoseconds(0);
+        }
+        if (g_sleep_stats) {
+            NoteSleep(duration,
+                      std::chrono::duration_cast<std::chrono::nanoseconds>(sleep_time));
+        }
     }
     return ret == WAIT_OBJECT_0;
 }
