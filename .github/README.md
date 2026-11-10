@@ -36,7 +36,7 @@ Sharp HUD at any render size · fights that cost the GPU 5 ms less · GoldHEN ch
 | ⚡ | **Fights and the chain cost about 5 ms less GPU time per frame.** The game hides dead debris and particles with a NaN position; their vertex shaders then walked the whole light-probe mesh (15 000 steps) for vertices that are never drawn. | `SHADPS4_PROBE_WALK_NAN_EXIT=1` | [#76](https://github.com/axylpup/shadPS4/pull/76) |
 | 🎮 | **Cheats panel.** GoldHEN cheat files are listed in a panel and switched live. Every cheat is checked against the game's code first; console code caves are moved into the emulator's memory. | **F6**, files in `user\cheats` | [#77](https://github.com/axylpup/shadPS4/pull/77) |
 | 🧊 | **Open menus no longer drop the game to 8 FPS.** With the frame-rate cap above the game's rate (cap 75, game at 60) any open panel made the present thread redraw old frames and starve the new ones. | always on | [#78](https://github.com/axylpup/shadPS4/pull/78) |
-| 🚪 | **Quit game button in the F3 menu.** Asks the same question as the quit hotkey; handy on a streaming client or a controller. | F3 → Quit game | [#79](https://github.com/axylpup/shadPS4/pull/79) (draft) |
+| 🚪 | **Quit game button in the F3 menu.** Asks the same question as the quit hotkey; handy on a streaming client or a controller. | F3 → Quit game | [#79](https://github.com/axylpup/shadPS4/pull/79) |
 
 Lines for `shadps4-flags-user.txt` (next to `shadPS4.exe`):
 
