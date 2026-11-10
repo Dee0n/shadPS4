@@ -1200,6 +1200,8 @@ void JitterFrame() {
     const RenderSize ref = Reference(g_aspect);
     const double ratio = now.width > 0 ? std::max(1.0, double(ref.width) / now.width) : 1.0;
     const u32 phases = std::clamp(u32(std::lround(8.0 * ratio * ratio)), 8u, 64u);
+    // A frame resolved without SMAA continues the sequence itself (vk_dlss.h NoteAltResolveDraw).
+    Vulkan::Dlss::g_jitter_phases.store(phases, std::memory_order_relaxed);
     g_jitter_k = (g_jitter_k + 1) % phases;
     const float jx = Halton(g_jitter_k + 1, 2) - 0.5f; // render px, (-0.5, 0.5)
     const float jy = Halton(g_jitter_k + 1, 3) - 0.5f;

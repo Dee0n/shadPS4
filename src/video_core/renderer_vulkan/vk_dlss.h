@@ -78,11 +78,45 @@ inline std::atomic<u64> g_resolve_ps{0};
 /// then the game's own resolve runs (the first frames of a session).
 inline std::atomic<bool> g_inputs_seen{false};
 
-/// PipelineCache::GetProgram: remembers where the resolve shader lives.
+/// The game's two other resolves into the same target. Play log 2026-11-10: about ten times in six
+/// minutes the game leaves T2x for three frames - two with fs_9c75f6a3 (one texture, ten taps: a
+/// spatial anti-aliasing without history), then one with fs_bb06bcb3 (one texture, one tap: a
+/// copy). Only T2x was replaced, so DLSS and DLSS 5 were off for those frames and the picture
+/// changed for a moment. They are the same back-side action now.
+/// SHADPS4_DLSS_ALT_RESOLVE: 0 = only T2x is replaced (as before), 1 (default) = these two as
+/// well, 2 = and DLSS starts a new history at the first frame of such a run.
+constexpr std::array<u64, 2> AltResolvePsHash{0x9c75f6a3, 0xbb06bcb3};
+inline std::array<std::atomic<u64>, 2> g_alt_resolve_ps{};
+inline u32 AltResolveMode() {
+    static const u32 mode = [] {
+        const char* v = std::getenv("SHADPS4_DLSS_ALT_RESOLVE");
+        return v ? static_cast<u32>(std::atoi(v)) : 1u;
+    }();
+    return mode;
+}
+
+/// PipelineCache::GetProgram: remembers where the resolve shaders live.
 inline void NoteProgram(bool fragment, u64 hash, VAddr base) {
-    if (fragment && hash == ResolvePsHash && Enabled()) [[unlikely]] {
-        g_resolve_ps.store(base, std::memory_order_relaxed);
+    if (!fragment) {
+        return;
     }
+    if (hash == ResolvePsHash && Enabled()) [[unlikely]] {
+        g_resolve_ps.store(base, std::memory_order_relaxed);
+    } else if ((hash == AltResolvePsHash[0] || hash == AltResolvePsHash[1]) && Enabled() &&
+               AltResolveMode() != 0) [[unlikely]] {
+        g_alt_resolve_ps[hash == AltResolvePsHash[1]].store(base, std::memory_order_relaxed);
+    }
+}
+
+/// -1, or which of the game's two other resolves this pixel shader is.
+inline int AltResolveIndex(VAddr ps_address) {
+    for (int i = 0; i < 2; ++i) {
+        const u64 a = g_alt_resolve_ps[i].load(std::memory_order_relaxed);
+        if (a != 0 && a == ps_address) [[unlikely]] {
+            return i;
+        }
+    }
+    return -1;
 }
 
 /// ClassifyDraw: is this draw's pixel shader the resolve, and is DLSS to replace it now?
@@ -110,6 +144,23 @@ inline std::atomic<u32> g_weights_flat_dw{0};
 /// 4 = an explicit offset (the emulator's Halton jitter, memory_patcher.cpp: t_jitter).
 inline thread_local u8 t_phase = 0;
 inline thread_local float t_jitter[2] = {}; ///< phase 4: the frame's (jx, jy) in render px
+/// A frame the game resolves without SMAA (AltResolvePsHash) has no weights draw to carry its
+/// offset, but the emulator's sequence goes on (memory_patcher.cpp JitterFrame, one step per
+/// frame): the offset is continued from the last index a weights draw carried. Phase 5 = phase 4
+/// with such a continued offset.
+inline thread_local bool t_weights_fresh = false; ///< a weights draw since this thread's last resolve
+inline std::atomic<u32> g_explicit_k{~0u};        ///< the last frame's Halton index (~0 = none)
+inline std::atomic<u32> g_jitter_phases{8};       ///< the sequence's length (JitterFrame)
+
+inline float Halton(u32 index, u32 base) {
+    float f = 1.0f, r = 0.0f;
+    while (index > 0) {
+        f /= static_cast<float>(base);
+        r += f * static_cast<float>(index % base);
+        index /= base;
+    }
+    return r;
+}
 
 /// Where the weights program's Info is known: remember its address and its CB's user-data slot.
 inline void NoteWeightsInfo(const Shader::Info& info, VAddr base) {
@@ -178,6 +229,20 @@ inline std::atomic<VAddr> g_depth_addr{DepthAddr};
 inline std::atomic<VAddr> g_hud_addr{0x26bd70000}; ///< the resolve's target = the HUD layer
 inline std::atomic<u32> g_game_width{1920};
 inline std::atomic<u32> g_game_height{1080};
+/// A T2x resolve has told where the HUD layer is: the other resolves are told from other uses of
+/// their shaders by that target.
+inline std::atomic<bool> g_hud_seen{false};
+inline std::array<ShaderTap, 2> g_alt_tap;
+inline std::array<std::atomic<VAddr>, 2> g_alt_color_addr{}; ///< what each of them samples
+
+/// ClassifyDraw: one of the game's other resolves into the HUD layer, and DLSS to replace it now?
+inline bool IsAltResolve(VAddr ps_address, VAddr target) {
+    return AltResolveIndex(ps_address) >= 0 &&
+           target == g_hud_addr.load(std::memory_order_relaxed) &&
+           g_hud_seen.load(std::memory_order_relaxed) &&
+           g_ready.load(std::memory_order_relaxed) && g_user_on.load(std::memory_order_relaxed) &&
+           g_inputs_seen.load(std::memory_order_relaxed);
+}
 
 /// Where a tapped program's Info is known: its texture slots in the (flattened) user data.
 inline void NoteTapInfo(ShaderTap& tap, const Shader::Info& info, VAddr base) {
@@ -228,6 +293,9 @@ inline void NoteShaderInfo(const Shader::Info& info, VAddr base) {
         NoteTapInfo(g_edges_tap, info, base);
     } else if (info.pgm_hash == ResolvePsHash) {
         NoteTapInfo(g_resolve_tap, info, base);
+    } else if ((info.pgm_hash == AltResolvePsHash[0] || info.pgm_hash == AltResolvePsHash[1]) &&
+               AltResolveMode() != 0) {
+        NoteTapInfo(g_alt_tap[info.pgm_hash == AltResolvePsHash[1]], info, base);
     }
 }
 
@@ -291,7 +359,39 @@ inline void NoteInputDraw(const AmdGpu::Regs& regs, VAddr ps) {
             }
         });
         StoreIfChanged(g_hud_addr, static_cast<VAddr>(regs.color_buffers[0].Address()));
+        StoreIfChanged(g_hud_seen, true);
+        t_weights_fresh = false;
     }
+}
+
+/// NoteDraw: one of the game's other resolves (AltResolvePsHash) -> the picture it samples, and
+/// the frame's jitter when no weights draw carried it.
+inline void NoteAltResolveDraw(const AmdGpu::Regs& regs, VAddr ps, int alt) {
+    if (static_cast<VAddr>(regs.color_buffers[0].Address()) !=
+        g_hud_addr.load(std::memory_order_relaxed)) {
+        return; // another use of the shader
+    }
+    if (ps == g_alt_tap[alt].ps.load(std::memory_order_acquire)) {
+        bool found = false;
+        ForEachTapImage(g_alt_tap[alt], regs, [&](const AmdGpu::Image& image) {
+            if (!found && image.GetDataFmt() == AmdGpu::DataFormat::Format8_8_8_8) {
+                StoreIfChanged(g_alt_color_addr[alt], static_cast<VAddr>(image.Address()));
+                found = true;
+            }
+        });
+    }
+    if (!t_weights_fresh) {
+        if (u32 k = g_explicit_k.load(std::memory_order_relaxed); k != ~0u) {
+            k = (k + 1) % std::max(g_jitter_phases.load(std::memory_order_relaxed), 1u);
+            g_explicit_k.store(k, std::memory_order_relaxed);
+            t_jitter[0] = Halton(k + 1, 2) - 0.5f;
+            t_jitter[1] = Halton(k + 1, 3) - 0.5f;
+            t_phase = 5;
+        } else if (t_phase == 1 || t_phase == 2) {
+            t_phase = 3 - t_phase; // the game's own two phases alternate
+        }
+    }
+    t_weights_fresh = false;
 }
 
 inline void NoteDraw(const AmdGpu::Regs& regs) {
@@ -303,9 +403,12 @@ inline void NoteDraw(const AmdGpu::Regs& regs) {
             if (ps != 0) {
                 NoteInputDraw(regs, ps);
             }
+        } else if (const int alt = AltResolveIndex(ps); alt >= 0) [[unlikely]] {
+            NoteAltResolveDraw(regs, ps, alt);
         }
         return;
     }
+    t_weights_fresh = true;
     const u32 ud = g_weights_ud.load(std::memory_order_relaxed);
     AmdGpu::Buffer vsharp;
     if (ud + 4 <= 16) {
@@ -336,8 +439,11 @@ inline void NoteDraw(const AmdGpu::Regs& regs) {
         t_jitter[0] = f;
         std::memcpy(&t_jitter[1], reinterpret_cast<const void*>(vsharp.base_address + 52),
                     sizeof(float));
+        // The tag is 100 + the sequence's index (JitterFrame).
+        g_explicit_k.store(static_cast<u32>(tag - 100.0f + 0.5f), std::memory_order_relaxed);
         return;
     }
+    StoreIfChanged(g_explicit_k, ~0u);
     t_phase = (f > 0.5f && f < 1.5f)   ? 1
               : (f > 1.5f && f < 2.5f) ? 2
               : (f > -0.5f && f < 0.5f) ? 3

@@ -1600,6 +1600,12 @@ Rasterizer::DrawClass Rasterizer::ClassifyDraw(const AmdGpu::Regs& regs) {
     if (Dlss::IsResolve(regs.ps_program.Address<VAddr>())) [[unlikely]] {
         return DrawClass::DlssResolve;
     }
+    // The game's two other resolves into the same target (vk_dlss.h AltResolvePsHash): the frames
+    // it draws without T2x; two more loads + compares.
+    if (Dlss::IsAltResolve(regs.ps_program.Address<VAddr>(),
+                           static_cast<VAddr>(regs.color_buffers[0].Address()))) [[unlikely]] {
+        return DrawClass::DlssResolve;
+    }
     // SHADPS4_SKIP_PS (test): that pixel shader's draws are dropped (as primitive type None).
     if (const u64 skip = Dlss::g_skip_ps.load(std::memory_order_relaxed);
         skip != 0 && skip == regs.ps_program.Address<VAddr>()) [[unlikely]] {
@@ -1667,16 +1673,24 @@ void Rasterizer::DlssResolve() {
     // 0x2f9e10000 + motion vectors + depth into the resolve's target; =2 or any failure this frame:
     // a plain copy of the tonemap output (the game without its temporal AA for that frame).
     ++dlss_calls;
-    ++dlss_phases[dlss_phase_in & 3];
+    ++dlss_phases[dlss_phase_in == 5 ? 0 : dlss_phase_in & 3];
     Dlss5::g_resolves.fetch_add(1, std::memory_order_release); // a game-rendered frame
     const auto& regs = liverpool->BackRegs();
+    // One of the game's other resolves (vk_dlss.h AltResolvePsHash) instead of T2x: the same
+    // action, from the picture that shader samples.
+    const int alt = Dlss::AltResolveIndex(regs.ps_program.Address<VAddr>());
+    if (alt >= 0) {
+        ++dlss_alt_calls;
+        dlss_reset_pending |= !dlss_last_alt && Dlss::AltResolveMode() == 2;
+    }
+    dlss_last_alt = alt >= 0;
     VideoCore::TextureCache::ImageDesc out_desc{regs.color_buffers[0], liverpool->BackCbExtent(0)};
     auto& out = texture_cache.GetImage(texture_cache.FindImage(out_desc, true));
     // The inputs come from this frame's SMAA edges draw and the resolve itself (vk_dlss.h "Any
     // render size"; the 1080p addresses until those ran). Found by address and size: 0x26b200000
     // also holds the minimap's 768x768 depth after the AA (play log 2026-10-17: depth "missing"
     // on 109,135 of 109,569 resolves).
-    const VAddr color_addr = Dlss::g_color_addr.load(std::memory_order_relaxed);
+    VAddr color_addr = Dlss::g_color_addr.load(std::memory_order_relaxed);
     const VAddr motion_addr = Dlss::g_motion_addr.load(std::memory_order_relaxed);
     const VAddr depth_addr = Dlss::g_depth_addr.load(std::memory_order_relaxed);
     const auto find = [&](VAddr address) -> VideoCore::Image* {
@@ -1684,7 +1698,35 @@ void Rasterizer::DlssResolve() {
             address, out.info.size.width, out.info.size.height);
         return id ? &texture_cache.GetImage(id) : nullptr;
     };
-    VideoCore::Image* in = find(color_addr);
+    VideoCore::Image* in = nullptr;
+    bool own_input = false;
+    if (alt >= 0) {
+        const VAddr own = Dlss::g_alt_color_addr[alt].load(std::memory_order_relaxed);
+        if (own != 0 && own != static_cast<VAddr>(regs.color_buffers[0].Address())) {
+            in = find(own);
+            if (in && in->info.pixel_format == out.info.pixel_format) {
+                color_addr = own;
+                own_input = true;
+            } else {
+                in = nullptr;
+            }
+        }
+    }
+    if (!in) {
+        in = find(color_addr);
+    }
+    if (alt >= 0 && (dlss_alt_calls <= 24 || (dlss_alt_calls & 63) == 0)) {
+        LOG_INFO(Render_Vulkan,
+                 "DLSS: the game's {} resolve fs_{:08x} replaced (#{}): colour {:#x} ({}, T2x "
+                 "frames use {:#x}), jitter {} ({:.3f}, {:.3f})",
+                 alt == 0 ? "spatial" : "copy", Dlss::AltResolvePsHash[alt], dlss_alt_calls,
+                 color_addr, !in ? "not found" : own_input ? "what it samples" : "the learned input",
+                 Dlss::g_color_addr.load(std::memory_order_relaxed),
+                 dlss_phase_in == 4   ? "from this frame's SMAA draw"
+                 : dlss_phase_in == 5 ? "continued from the last SMAA draw"
+                                      : "by the game's phase",
+                 dlss_jitter_in[0], dlss_jitter_in[1]);
+    }
     if (!in || in->info.pixel_format != out.info.pixel_format) [[unlikely]] {
         // A target that keeps stale memory would show (a 1440p patch before 1.1: a yellow
         // picture, RTX 5070 Ti report 10-20). Off the 1080p frame DLSS then steps aside for the
@@ -1758,7 +1800,7 @@ void Rasterizer::DlssResolve() {
             float jx = 0.0f, jy = 0.0f;
             // Phase 4: the emulator's Halton offset, exact for this frame (memory_patcher.cpp
             // JitterFrame). A switch between it and the game's 2 phases starts a new history.
-            const bool explicit_jitter = dlss_phase_in == 4;
+            const bool explicit_jitter = dlss_phase_in == 4 || dlss_phase_in == 5;
             dlss_reset_pending |= explicit_jitter != dlss_last_explicit;
             dlss_last_explicit = explicit_jitter;
             if (explicit_jitter) {

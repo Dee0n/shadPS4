@@ -335,6 +335,8 @@ public:
     u64 dlss_evaluated{};
     u32 dlss_last_combo{};
     bool dlss_reset_pending{true};
+    u64 dlss_alt_calls{};                 ///< resolves that replaced one of the game's other two
+    bool dlss_last_alt{};                 ///< the last resolve was one of them
     struct NeoIdDerive;
     std::shared_ptr<NeoIdDerive> neo_id_derive;
     VAddr neo_depth_addr{};
